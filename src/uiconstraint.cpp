@@ -1,16 +1,20 @@
 // uiconstraint.cpp - Constrain the in-game HUD to a centered 16:9 / 21:9 box.
 //
-// The Townfall HUD (health/stamina bars, item slots, prompts) is drawn with
-// the classic FCanvas immediate path inside UGameViewportClient::Draw - not
-// through SCanvas/UMG slots (verified empirically). Draw wraps HUD rendering
-// in UCanvas::ApplySafeZoneTransform / PopSafeZoneTransform every frame; with
-// zero safe-zone margins both are no-ops.
+// Rendering order in UGameViewportClient::Draw (verified in-engine):
+//   ApplySafeZone -> [3D scene via FCanvas] -> PopSafeZone -> SetCanvas ->
+//   AHUD::DrawHUD -> ...
+// so the safe-zone window wraps the SCENE, not the HUD. The HUD is drawn by
+// AHUD::DrawHUD on the canvas passed to AHUD::SetCanvas. This module:
 //
-// With [UI] Constrain=1 the Apply hook pushes an extra FCanvas transform
-// (scale into a centered box of the configured aspect) and the Pop hook pops
-// it again right after the HUD section. Menus, inventory and pause screens
-// render via Slate/UMG and are untouched; no game-state detection is needed
-// because the safe-zone pair only wraps the HUD draw.
+//   - hooks AHUD::SetCanvas to capture the HUD's UCanvas each frame
+//   - hooks AHUD::DrawHUD and wraps the original call with an extra FCanvas
+//     transform (scale into a centered box of the configured aspect) that is
+//     pushed before and popped after the HUD draws
+//
+// DrawHUD only runs while a HUD exists, so menus / inventory / pause screens
+// (pure Slate/UMG) are untouched by construction. UCanvas+0x2e0 holds the
+// FCanvas transform-stack TArray (FCanvas+0x28); PushAbsoluteTransform takes
+// the FCanvas base, the TArray::Pop takes the stack.
 
 #include <windows.h>
 
@@ -66,54 +70,64 @@ void LoadConfig() {
     LogLine("UI: Constrain=%d Aspect=%.4f", gConstrain ? 1 : 0, gAspect);
 }
 
-using ApplySafeZone_t = void (*)(void* canvas);
-using PopSafeZone_t = void (*)(void* canvas);
+using SetCanvas_t = void (*)(void* hud, void* canvas);
+using DrawHUD_t = void (*)(void* hud);
 using PushAbsoluteTransform_t = void (*)(void* fcanvas, const float* matrix);
 using TransformStackPop_t = void (*)(void* stack);
 
-ApplySafeZone_t g_origApply = nullptr;
-PopSafeZone_t g_origPop = nullptr;
+SetCanvas_t g_origSetCanvas = nullptr;
+DrawHUD_t g_origDrawHUD = nullptr;
 PushAbsoluteTransform_t gPush = nullptr;
 TransformStackPop_t gStackPop = nullptr;
 
-bool gTransformPushed = false;  // HUD draw is single-threaded; plain bool is fine
+void* gHudCanvas = nullptr;  // UCanvas of the current HUD frame
 
-void HookApplySafeZone(void* canvas) {
-    while (!g_origApply) Sleep(0);
-    if (gConstrain && gPush && gStackPop) {
-        const float W = static_cast<float>(*reinterpret_cast<int*>(static_cast<char*>(canvas) + 0x40));
-        const float H = static_cast<float>(*reinterpret_cast<int*>(static_cast<char*>(canvas) + 0x44));
-        if (W > 0.f && H > 0.f) {
-            float boxW, boxH;
-            if (static_cast<double>(W) / H > gAspect) {
-                boxH = H;
-                boxW = static_cast<float>(H * gAspect);
-            } else {
-                boxW = W;
-                boxH = static_cast<float>(W / gAspect);
-            }
-            const float m[16] = {boxW / W, 0.f,      0.f, 0.f,  //
-                                 0.f,      boxH / H, 0.f, 0.f,  //
-                                 0.f,      0.f,      1.f, 0.f,  //
-                                 (W - boxW) / 2.f, (H - boxH) / 2.f, 0.f, 1.f};
-            void* fcanvas = *reinterpret_cast<void**>(static_cast<char*>(canvas) + 0x2e0);
-            if (fcanvas) {
-                gPush(fcanvas, m);
-                gTransformPushed = true;
-            }
-        }
+void PushBoxTransform() {
+    if (!gHudCanvas) return;
+    char* canvas = static_cast<char*>(gHudCanvas);
+    const float W = static_cast<float>(*reinterpret_cast<int*>(canvas + 0x40));
+    const float H = static_cast<float>(*reinterpret_cast<int*>(canvas + 0x44));
+    if (W <= 0.f || H <= 0.f) return;
+
+    float boxW, boxH;
+    if (static_cast<double>(W) / H > gAspect) {
+        boxH = H;
+        boxW = static_cast<float>(H * gAspect);
+    } else {
+        boxW = W;
+        boxH = static_cast<float>(W / gAspect);
     }
-    g_origApply(canvas);
+    const float m[16] = {boxW / W, 0.f,      0.f, 0.f,  //
+                         0.f,      boxH / H, 0.f, 0.f,  //
+                         0.f,      0.f,      1.f, 0.f,  //
+                         (W - boxW) / 2.f, (H - boxH) / 2.f, 0.f, 1.f};
+    void* stack = *reinterpret_cast<void**>(canvas + 0x2e0);
+    if (!stack) return;
+    void* fcanvas = static_cast<char*>(stack) - 0x28;
+    gPush(fcanvas, m);
 }
 
-void HookPopSafeZone(void* canvas) {
-    while (!g_origPop) Sleep(0);
-    if (gTransformPushed && gStackPop) {
-        gTransformPushed = false;
-        void* fcanvas = *reinterpret_cast<void**>(static_cast<char*>(canvas) + 0x2e0);
-        if (fcanvas) gStackPop(fcanvas);  // TArray<FTransformEntry> at FCanvas+0
+void PopBoxTransform() {
+    if (!gHudCanvas) return;
+    void* stack = *reinterpret_cast<void**>(static_cast<char*>(gHudCanvas) + 0x2e0);
+    if (stack) gStackPop(stack);
+}
+
+void HookSetCanvas(void* hud, void* canvas) {
+    while (!g_origSetCanvas) Sleep(0);
+    gHudCanvas = canvas;
+    g_origSetCanvas(hud, canvas);
+}
+
+void HookDrawHUD(void* hud) {
+    while (!g_origDrawHUD) Sleep(0);
+    if (gConstrain && gPush && gStackPop) {
+        PushBoxTransform();
+        g_origDrawHUD(hud);
+        PopBoxTransform();
+        return;
     }
-    g_origPop(canvas);
+    g_origDrawHUD(hud);
 }
 
 }  // namespace
@@ -125,8 +139,6 @@ void InstallUIConstraint(HMODULE game) {
         return;
     }
 
-    // Functions called (not hooked): FCanvas::PushAbsoluteTransform and the
-    // transform-stack TArray::Pop used by the engine's own safe-zone pop.
     static const unsigned char kSigPush[] = {
         0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
         0x24, 0xC0, 0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x05, 0x11};
@@ -143,14 +155,17 @@ void InstallUIConstraint(HMODULE game) {
         return;
     }
 
-    static const unsigned char kSigApply[] = {
-        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20,
-        0x41, 0x56, 0x48, 0x81, 0xEC, 0xB0, 0x00, 0x00};
-    InstallHook(game, "ApplySafeZone", kSigApply, sizeof(kSigApply), 17,
-                reinterpret_cast<void*>(&HookApplySafeZone), reinterpret_cast<void**>(&g_origApply));
+    static const unsigned char kSigSetCanvas[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20,
+        0x80, 0x3D, 0x87, 0x24};
+    InstallHook(game, "HUDSetCanvas", kSigSetCanvas, sizeof(kSigSetCanvas), 15,
+                reinterpret_cast<void*>(&HookSetCanvas),
+                reinterpret_cast<void**>(&g_origSetCanvas));
 
-    static const unsigned char kSigPop[] = {
-        0x40, 0x53, 0x48, 0x81, 0xEC, 0xB0, 0x00, 0x00, 0x00, 0x83, 0xB9, 0x90, 0x00, 0x00, 0x00};
-    InstallHook(game, "PopSafeZone", kSigPop, sizeof(kSigPop), 15,
-                reinterpret_cast<void*>(&HookPopSafeZone), reinterpret_cast<void**>(&g_origPop));
+    static const unsigned char kSigDrawHUD[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x48, 0x8D, 0x6C, 0x24, 0xA9, 0x48, 0x81, 0xEC, 0xA0,
+        0x00, 0x00, 0x00, 0x4C, 0x8D, 0x89, 0x28, 0x03, 0x00, 0x00, 0x48, 0x8B, 0xD9, 0x49, 0x8D,
+        0x49, 0x0C, 0x8B, 0x01, 0x41, 0xC7, 0x41, 0x08, 0x00, 0x00};
+    InstallHook(game, "HUDDrawHUD", kSigDrawHUD, sizeof(kSigDrawHUD), 18,
+                reinterpret_cast<void*>(&HookDrawHUD), reinterpret_cast<void**>(&g_origDrawHUD));
 }
