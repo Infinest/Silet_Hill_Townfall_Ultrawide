@@ -89,8 +89,13 @@ bool InstallHook(HMODULE game, const char* name, const unsigned char* signature,
 
     for (int m = 0; m < matches; ++m) {
         const uintptr_t site = sites[m];
+        // Trampoline: copied prologue + r11 jump-back. The prologue's
+        // [rsp+x] stores land in the hook's outgoing-argument home space
+        // (dead after the call), which has proven safe for the hooked
+        // functions; deeper scratch frames collided with live locals.
         auto* trampoline = static_cast<unsigned char*>(
-            VirtualAlloc(nullptr, patchLen + 13, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+            VirtualAlloc(nullptr, patchLen + 13, MEM_COMMIT | MEM_RESERVE,
+                         PAGE_EXECUTE_READWRITE));
         if (!trampoline) {
             LogLine("hook %s: VirtualAlloc failed (%lu)", name, GetLastError());
             continue;
@@ -124,9 +129,13 @@ void* FindUniquePattern(HMODULE game, const unsigned char* signature, int signat
     int matches = 0;
     for (size_t i = 0; i + signatureLen <= text.size; ++i) {
         if (memcmp(text.begin + i, signature, signatureLen) == 0) {
-            site = reinterpret_cast<uintptr_t>(text.begin + i);
+            if (matches == 0) site = reinterpret_cast<uintptr_t>(text.begin + i);
             ++matches;
         }
+    }
+    if (matches != 1) {
+        LogLine("FindUniquePattern: sigLen=%d matches=%d first=%llX", signatureLen, matches,
+                (unsigned long long)site);
     }
     return matches == 1 ? reinterpret_cast<void*>(site) : nullptr;
 }

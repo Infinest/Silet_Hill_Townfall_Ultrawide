@@ -23,6 +23,23 @@
 #include "log.h"
 #include "patch.h"
 
+// First-chance logger for fatal exceptions: records code + RIP (module
+// offset) so crashes in the game can be mapped to the exact instruction
+// without needing a debugger, then lets normal handling continue.
+static LONG WINAPI VectoredExceptionLogger(EXCEPTION_POINTERS* ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+        code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_STACK_OVERFLOW) {
+        HMODULE game = GetModuleHandleW(nullptr);
+        uintptr_t base = reinterpret_cast<uintptr_t>(game);
+        uintptr_t rip = ep->ContextRecord->Rip;
+        LogLine("CRASH code=%X rip=%llX gameoff=%llX addr=%llX", code,
+                (unsigned long long)rip, (unsigned long long)(rip - base),
+                (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void InstallDiagnosticHooks(HMODULE game);
 void InstallUIConstraint(HMODULE game);
 
@@ -92,6 +109,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        AddVectoredExceptionHandler(1, VectoredExceptionLogger);
         LogLine("dxgi proxy attached (pid %lu)", GetCurrentProcessId());
         HANDLE h = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
         if (h) CloseHandle(h);
