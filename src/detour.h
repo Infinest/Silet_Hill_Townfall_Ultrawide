@@ -14,3 +14,6 @@
 bool InstallHook(HMODULE gameModule, const char* name, const unsigned char* signature,
                  int signatureLen, int patchLen, void* hookFn, void** origOut,
                  bool allowMultiple = false);
+
+// Returns the address of the single .text match of `signature`, or nullptr.
+void* FindUniquePattern(HMODULE gameModule, const unsigned char* signature, int signatureLen);

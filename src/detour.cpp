@@ -72,17 +72,18 @@ bool InstallHook(HMODULE game, const char* name, const unsigned char* signature,
     // Find all matches up front; require exactly one unless allowMultiple.
     uintptr_t sites[16];
     int matches = 0;
-    for (size_t i = 0; i + signatureLen <= text.size && matches < 16; ++i) {
+    for (size_t i = 0; i + signatureLen <= text.size; ++i) {
         if (memcmp(text.begin + i, signature, signatureLen) == 0) {
-            sites[matches++] = reinterpret_cast<uintptr_t>(text.begin + i);
+            if (matches < 16) sites[matches] = reinterpret_cast<uintptr_t>(text.begin + i);
+            ++matches;
         }
     }
-    int overflow = 0;
-    for (size_t i = 0; i + signatureLen <= text.size; ++i) {
-        if (memcmp(text.begin + i, signature, signatureLen) == 0) ++overflow;
+    if (matches == 0 || (!allowMultiple && matches != 1)) {
+        LogLine("hook %s: expected %d match(es), found %d", name, allowMultiple ? 16 : 1, matches);
+        return false;
     }
-    if ((!allowMultiple && overflow != 1) || overflow == 0 || overflow > 16) {
-        LogLine("hook %s: expected %d match(es), found %d", name, allowMultiple ? 16 : 1, overflow);
+    if (matches > 16) {
+        LogLine("hook %s: too many matches (%d)", name, matches);
         return false;
     }
 
@@ -114,4 +115,18 @@ bool InstallHook(HMODULE game, const char* name, const unsigned char* signature,
                 (unsigned long long)(site - reinterpret_cast<uintptr_t>(game)));
     }
     return matches > 0;
+}
+
+void* FindUniquePattern(HMODULE game, const unsigned char* signature, int signatureLen) {
+    SectionRange text{};
+    if (!FindTextSection(game, text)) return nullptr;
+    uintptr_t site = 0;
+    int matches = 0;
+    for (size_t i = 0; i + signatureLen <= text.size; ++i) {
+        if (memcmp(text.begin + i, signature, signatureLen) == 0) {
+            site = reinterpret_cast<uintptr_t>(text.begin + i);
+            ++matches;
+        }
+    }
+    return matches == 1 ? reinterpret_cast<void*>(site) : nullptr;
 }

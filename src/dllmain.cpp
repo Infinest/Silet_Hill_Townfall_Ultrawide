@@ -24,6 +24,7 @@
 #include "patch.h"
 
 void InstallDiagnosticHooks(HMODULE game);
+void InstallUIConstraint(HMODULE game);
 
 static bool ConfigEnabled() {
     wchar_t path[MAX_PATH];
@@ -60,6 +61,10 @@ static DWORD WINAPI InitThread(LPVOID) {
         LogLine("ERROR: game module not found");
         return 1;
     }
+
+    // UI constraint (step 2): hooked before the patches so the full chain is
+    // captured early.
+    InstallUIConstraint(game);
 
     // Diagnostic instrumentation first: captures pre-patch behavior too.
     InstallDiagnosticHooks(game);
