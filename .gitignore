@@ -1,0 +1,24 @@
+# Build outputs
+dist/
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Reversing toolchain artifacts (regenerable from the game + tools)
+tools/symbols.txt
+tools/symbols_sorted.txt
+tools/*.exe
+tools/*.log
+tools/ucs.txt
+tools/gpd.txt
+tools/cpmvr.txt
+
+# Runtime artifacts (live in the game dir, not the project)
+TownfallUltraWide.log
+TownfallUltraWide.ini
+
+# Python
+__pycache__/
+*.pyc
+tools/dump_log.txt
