@@ -89,10 +89,10 @@ bool InstallHook(HMODULE game, const char* name, const unsigned char* signature,
 
     for (int m = 0; m < matches; ++m) {
         const uintptr_t site = sites[m];
-        // Trampoline: copied prologue + r11 jump-back. The prologue's
-        // [rsp+x] stores land in the hook's outgoing-argument home space
-        // (dead after the call), which has proven safe for the hooked
-        // functions; deeper scratch frames collided with live locals.
+        // Trampoline: copied prologue + r11 jump-back. Only hook functions
+        // with rsp-relative (non-rbp) prologues may use this - their [rsp+x]
+        // stores land in the outgoing-argument home space, which is dead by
+        // ABI. Vtable hooks are used for anything with an rbp frame.
         auto* trampoline = static_cast<unsigned char*>(
             VirtualAlloc(nullptr, patchLen + 13, MEM_COMMIT | MEM_RESERVE,
                          PAGE_EXECUTE_READWRITE));

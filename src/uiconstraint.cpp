@@ -1,20 +1,17 @@
 // uiconstraint.cpp - Constrain the in-game HUD to a centered 16:9 / 21:9 box.
 //
-// Rendering order in UGameViewportClient::Draw (verified in-engine):
-//   ApplySafeZone -> [3D scene via FCanvas] -> PopSafeZone -> SetCanvas ->
-//   AHUD::DrawHUD -> ...
-// so the safe-zone window wraps the SCENE, not the HUD. The HUD is drawn by
-// AHUD::DrawHUD on the canvas passed to AHUD::SetCanvas. This module:
+// The visible HUD is Slate/UMG: UUserWidget::AddToViewport ->
+// UGameViewportClient::AddViewportWidgetContent -> SOverlay::AddSlot on the
+// viewport overlay (UGameViewportClient+0x120). All HUD/menu widgets are
+// children of that SOverlay; SOverlay::OnArrangeChildren (vtable slot 71)
+// hands each child its FGeometry. Hooking that virtual and presenting the
+// children a modified (centered box) allotted geometry constrains the UI
+// without touching a single draw call.
 //
-//   - hooks AHUD::SetCanvas to capture the HUD's UCanvas each frame
-//   - hooks AHUD::DrawHUD and wraps the original call with an extra FCanvas
-//     transform (scale into a centered box of the configured aspect) that is
-//     pushed before and popped after the HUD draws
-//
-// DrawHUD only runs while a HUD exists, so menus / inventory / pause screens
-// (pure Slate/UMG) are untouched by construction. UCanvas+0x2e0 holds the
-// FCanvas transform-stack TArray (FCanvas+0x28); PushAbsoluteTransform takes
-// the FCanvas base, the TArray::Pop takes the stack.
+// UGameViewportClient is reached via SGameLayerManager (captured from a hook
+// on GetGameViewportDPIScale, rcx = manager):
+//   manager+0x2f8 TAttribute<FSceneViewport*> -> Get() -> FSceneViewport
+//   [FSV+0x38] = UGameViewportClient; [GVC+0x120] = ViewportOverlay
 
 #include <windows.h>
 
@@ -59,6 +56,7 @@ bool ConfigAspect(double* out) {
 }
 
 bool gConstrain = false;
+bool gModify = false;  // phase 2: actually rewrite the geometry
 double gAspect = 16.0 / 9.0;
 bool gCfgLoaded = false;
 
@@ -66,68 +64,204 @@ void LoadConfig() {
     if (gCfgLoaded) return;
     gCfgLoaded = true;
     gConstrain = ConfigInt(L"Constrain", 0) != 0;
+    gModify = ConfigInt(L"Modify", 0) != 0;
     if (!ConfigAspect(&gAspect)) gAspect = 16.0 / 9.0;
-    LogLine("UI: Constrain=%d Aspect=%.4f", gConstrain ? 1 : 0, gAspect);
+    LogLine("UI: Constrain=%d Modify=%d Aspect=%.4f", gConstrain ? 1 : 0, gModify ? 1 : 0,
+            gAspect);
 }
 
-using SetCanvas_t = void (*)(void* hud, void* canvas);
-using DrawHUD_t = void (*)(void* hud);
-using PushAbsoluteTransform_t = void (*)(void* fcanvas, const float* matrix);
-using TransformStackPop_t = void (*)(void* stack);
+// ---- context capture (SGameLayerManager -> UGameViewportClient) -----------
 
-SetCanvas_t g_origSetCanvas = nullptr;
-DrawHUD_t g_origDrawHUD = nullptr;
-PushAbsoluteTransform_t gPush = nullptr;
-TransformStackPop_t gStackPop = nullptr;
+using AttrGet_t = void* (*)(void* attr);
+using DpiScale_t = float (*)(void* manager);
+using Arrange_t = void (*)(void* this_, void* allottedGeometry, void* arrangedChildren);
+using AddSlot_t = void* (*)(void* this_, void* slotArgs);
 
-void* gHudCanvas = nullptr;  // UCanvas of the current HUD frame
+AttrGet_t gAttrGet = nullptr;
+DpiScale_t g_origDpi = nullptr;
+Arrange_t g_origArrange = nullptr;
+AddSlot_t g_origAddSlot = nullptr;
 
-void PushBoxTransform() {
-    if (!gHudCanvas) return;
-    char* canvas = static_cast<char*>(gHudCanvas);
-    const float W = static_cast<float>(*reinterpret_cast<int*>(canvas + 0x40));
-    const float H = static_cast<float>(*reinterpret_cast<int*>(canvas + 0x44));
-    if (W <= 0.f || H <= 0.f) return;
+void* gViewportOverlay = nullptr;
+uintptr_t gGameBase = 0;
+uintptr_t gGameEnd = 0;
 
-    float boxW, boxH;
-    if (static_cast<double>(W) / H > gAspect) {
-        boxH = H;
-        boxW = static_cast<float>(H * gAspect);
-    } else {
-        boxW = W;
-        boxH = static_cast<float>(W / gAspect);
+bool IsGamePtr(void* p) {
+    if (!gGameBase) {
+        HMODULE game = GetModuleHandleW(nullptr);
+        gGameBase = reinterpret_cast<uintptr_t>(game);
+        gGameEnd = gGameBase + 0xA978000;
     }
-    const float m[16] = {boxW / W, 0.f,      0.f, 0.f,  //
-                         0.f,      boxH / H, 0.f, 0.f,  //
-                         0.f,      0.f,      1.f, 0.f,  //
-                         (W - boxW) / 2.f, (H - boxH) / 2.f, 0.f, 1.f};
-    void* stack = *reinterpret_cast<void**>(canvas + 0x2e0);
-    if (!stack) return;
-    void* fcanvas = static_cast<char*>(stack) - 0x28;
-    gPush(fcanvas, m);
+    if (reinterpret_cast<uintptr_t>(p) <= 0x10000) return false;
+    void* vt = *reinterpret_cast<void**>(p);
+    return reinterpret_cast<uintptr_t>(vt) >= gGameBase &&
+           reinterpret_cast<uintptr_t>(vt) < gGameEnd;
 }
 
-void PopBoxTransform() {
-    if (!gHudCanvas) return;
-    void* stack = *reinterpret_cast<void**>(static_cast<char*>(gHudCanvas) + 0x2e0);
-    if (stack) gStackPop(stack);
-}
+int gCaptureAttempts = 0;
 
-void HookSetCanvas(void* hud, void* canvas) {
-    while (!g_origSetCanvas) Sleep(0);
-    gHudCanvas = canvas;
-    g_origSetCanvas(hud, canvas);
-}
+void CaptureContext(void* manager) {
+    if (gViewportOverlay || !gAttrGet || gCaptureAttempts >= 400) return;
+    ++gCaptureAttempts;
+    if (!IsGamePtr(manager)) return;
 
-void HookDrawHUD(void* hud) {
-    while (!g_origDrawHUD) Sleep(0);
-    if (gConstrain && gPush && gStackPop) {
-        PushBoxTransform();
-        g_origDrawHUD(hud);
-        PopBoxTransform();
-        return;
+    void* fsv = nullptr;
+    void* attrSlot = nullptr;
+    __try {
+        attrSlot = gAttrGet(static_cast<char*>(manager) + 0x2f8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;  // manager still under construction - retry later
     }
-    g_origDrawHUD(hud);
+    if (attrSlot && reinterpret_cast<uintptr_t>(attrSlot) > 0x10000)
+        fsv = *reinterpret_cast<void**>(attrSlot);
+    if (gCaptureAttempts <= 6)
+        LogLine("UI: hops manager=%llX attr=%llX fsv=%llX", (unsigned long long)(uintptr_t)manager,
+                (unsigned long long)(uintptr_t)attrSlot, (unsigned long long)(uintptr_t)fsv);
+    if (!IsGamePtr(fsv)) return;
+    void* gvc = *reinterpret_cast<void**>(static_cast<char*>(fsv) + 0x38);
+    if (!IsGamePtr(gvc)) return;
+    void* overlay = *reinterpret_cast<void**>(static_cast<char*>(gvc) + 0x120);
+    if (!IsGamePtr(overlay)) return;
+    gViewportOverlay = overlay;
+    LogLine("UI: viewport overlay captured %llX", (unsigned long long)(uintptr_t)overlay);
+}
+
+// AddSlot instance counting: the ViewportOverlay is the SOverlay that
+// receives the AddToViewport widget bursts.
+struct SlotCount {
+    void* instance;
+    int count;
+};
+SlotCount g_slotCounts[32] = {};
+volatile LONG g_addSlotCalls = 0;
+
+void* HookAddSlot(void* this_, void* slotArgs) {
+    while (!g_origAddSlot) Sleep(0);
+    if (gViewportOverlay == nullptr && IsGamePtr(this_)) {
+        for (auto& sc : g_slotCounts) {
+            if (sc.instance == this_) {
+                ++sc.count;
+                break;
+            }
+            if (sc.instance == nullptr) {
+                sc.instance = this_;
+                sc.count = 1;
+                break;
+            }
+        }
+        LONG n = InterlockedIncrement(&g_addSlotCalls);
+        if (n == 12 || n == 60) {
+            for (auto& sc : g_slotCounts) {
+                if (sc.instance)
+                    LogLine("UI: addslot %llX x%d", (unsigned long long)(uintptr_t)sc.instance,
+                            sc.count);
+            }
+        }
+        // the first instance to reach 4 add-slot calls is almost certainly the
+        // viewport overlay (game widgets arrive in bursts)
+        for (auto& sc : g_slotCounts) {
+            if (sc.instance == this_ && sc.count >= 4 && gViewportOverlay == nullptr) {
+                gViewportOverlay = this_;
+                LogLine("UI: overlay via addslot %llX", (unsigned long long)(uintptr_t)this_);
+            }
+        }
+    }
+    return g_origAddSlot(this_, slotArgs);
+}
+
+float HookDpi(void* manager) {
+    while (!g_origDpi) Sleep(0);
+    LoadConfig();
+    CaptureContext(manager);
+    return g_origDpi(manager);
+}
+
+// ---- SOverlay::OnArrangeChildren (vtable slot 71) -------------------------
+
+volatile LONG g_arrangeLogs = 0;
+
+void HookArrange(void* this_, void* geo, void* arranged) {
+    // Identify the viewport overlay empirically: it is the SOverlay arranged
+    // with a full-display-width geometry.
+    double d[8] = {};
+    memcpy(d, geo, sizeof(d));
+    if (gConstrain && InterlockedIncrement(&g_arrangeLogs) <= 10) {
+        int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
+        LogLine("UI: arrange this=%llX geo=%.0f %.0f | %.0f %.0f | %f %f | %f %f slots=%d",
+                (unsigned long long)(uintptr_t)this_, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+                slots);
+    }
+    if (gConstrain && gViewportOverlay == nullptr && d[0] > 3000.0 && d[0] < 20000.0) {
+        int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
+        if (slots >= 2 && InterlockedIncrement(&g_arrangeLogs) <= 10)
+            LogLine("UI: candidate overlay=%llX geo=%f %f | %f %f | %f %f | %f %f slots=%d",
+                    (unsigned long long)(uintptr_t)this_, d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+                    d[7], slots);
+        // the first persistent full-width overlay with several children wins
+        static void* lastCandidate = nullptr;
+        static int lastCandidateHits = 0;
+        if (this_ == lastCandidate) {
+            if (++lastCandidateHits >= 5) gViewportOverlay = this_;
+        } else {
+            lastCandidate = this_;
+            lastCandidateHits = 1;
+        }
+    }
+    if (gConstrain && this_ == gViewportOverlay && gModify) {
+        // Present the children a centered box. FGeometry (double precision):
+        //   +0x00 Size, +0x10 Position, +0x20 AbsolutePosition (FVector2D
+        //   doubles each), +0x30 AbsoluteScale.
+        // FGeometry layout (from the PDB via DIA, len 0x38, float-based):
+        //   +0x00 Size (FVector2f), +0x08 Scale, +0x0C AbsolutePosition,
+        //   +0x14 Position (local), +0x1C AccumulatedRenderTransform,
+        //   +0x34 bHasRenderTransform.
+        char* g = static_cast<char*>(geo);
+        const float W = *reinterpret_cast<float*>(g + 0x00);
+        const float H = *reinterpret_cast<float*>(g + 0x04);
+        if (W > 0.f && H > 0.f) {
+            float boxW, boxH;
+            if (static_cast<double>(W) / H > gAspect) {
+                boxH = H;
+                boxW = static_cast<float>(H * gAspect);
+            } else {
+                boxW = W;
+                boxH = static_cast<float>(W / gAspect);
+            }
+            const float ox = (W - boxW) / 2.f;
+            const float oy = (H - boxH) / 2.f;
+            char copy[0x60];
+            memcpy(copy, geo, sizeof(copy));
+            *reinterpret_cast<float*>(copy + 0x00) = boxW;
+            *reinterpret_cast<float*>(copy + 0x04) = boxH;
+            *reinterpret_cast<float*>(copy + 0x0C) += ox;  // AbsolutePosition
+            *reinterpret_cast<float*>(copy + 0x10) += oy;
+            *reinterpret_cast<float*>(copy + 0x14) += ox;  // Position
+            *reinterpret_cast<float*>(copy + 0x18) += oy;
+            *reinterpret_cast<float*>(copy + 0x2C) += ox;  // AccumulatedRender
+            *reinterpret_cast<float*>(copy + 0x30) += oy;  //   Transform translation
+            g_origArrange(this_, copy, arranged);
+            return;
+        }
+    }
+    g_origArrange(this_, geo, arranged);
+}
+
+bool HookVtableSlot(uintptr_t vtableRva, int slot, uintptr_t expectedTarget, void* wrapper,
+                    const char* name) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    void** entry = reinterpret_cast<void**>(base + vtableRva);
+    void** slotPtr = entry + slot;
+    if (*slotPtr != reinterpret_cast<void*>(base + expectedTarget)) {
+        LogLine("UI: %s slot mismatch (got %llX) - not hooked", name,
+                (unsigned long long)(uintptr_t)*slotPtr);
+        return false;
+    }
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(slotPtr, 8, PAGE_READWRITE, &oldProtect)) return false;
+    *slotPtr = wrapper;
+    VirtualProtect(slotPtr, 8, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), slotPtr, 8);
+    return true;
 }
 
 }  // namespace
@@ -139,33 +273,33 @@ void InstallUIConstraint(HMODULE game) {
         return;
     }
 
-    static const unsigned char kSigPush[] = {
-        0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D, 0x6C,
-        0x24, 0xC0, 0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x05, 0x11};
-    gPush = reinterpret_cast<PushAbsoluteTransform_t>(
-        FindUniquePattern(game, kSigPush, sizeof(kSigPush)));
-    static const unsigned char kSigStackPop[] = {
-        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x4C, 0x63, 0x59, 0x08, 0xB8, 0x80, 0x00, 0x00, 0x00,
-        0x4C};
-    gStackPop = reinterpret_cast<TransformStackPop_t>(
-        FindUniquePattern(game, kSigStackPop, sizeof(kSigStackPop)));
-    if (!gPush || !gStackPop) {
-        LogLine("UI: transform resolve failed gPush=%llX gStackPop=%llX - disabled",
-                (unsigned long long)(uintptr_t)gPush, (unsigned long long)(uintptr_t)gStackPop);
+    static const unsigned char kSigAttrGet[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xFF, 0x48, 0x8B, 0xD9,
+        0x39, 0x79, 0x18, 0x74, 0x09, 0x48, 0x8B, 0x49};
+    gAttrGet = reinterpret_cast<AttrGet_t>(FindUniquePattern(game, kSigAttrGet, sizeof(kSigAttrGet)));
+    if (!gAttrGet) {
+        LogLine("UI: attribute getter not found - disabled");
         return;
     }
 
-    static const unsigned char kSigSetCanvas[] = {
-        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20,
-        0x80, 0x3D, 0x87, 0x24};
-    InstallHook(game, "HUDSetCanvas", kSigSetCanvas, sizeof(kSigSetCanvas), 15,
-                reinterpret_cast<void*>(&HookSetCanvas),
-                reinterpret_cast<void**>(&g_origSetCanvas));
+    static const unsigned char kSigAddSlot[] = {
+        0x48, 0x89, 0x6C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20,
+        0x41, 0x56, 0x48, 0x81, 0xEC, 0xE0, 0x00};
+    InstallHook(game, "SOverlayAddSlot", kSigAddSlot, sizeof(kSigAddSlot), 17,
+                reinterpret_cast<void*>(&HookAddSlot), reinterpret_cast<void**>(&g_origAddSlot));
 
-    static const unsigned char kSigDrawHUD[] = {
-        0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x48, 0x8D, 0x6C, 0x24, 0xA9, 0x48, 0x81, 0xEC, 0xA0,
-        0x00, 0x00, 0x00, 0x4C, 0x8D, 0x89, 0x28, 0x03, 0x00, 0x00, 0x48, 0x8B, 0xD9, 0x49, 0x8D,
-        0x49, 0x0C, 0x8B, 0x01, 0x41, 0xC7, 0x41, 0x08, 0x00, 0x00};
-    InstallHook(game, "HUDDrawHUD", kSigDrawHUD, sizeof(kSigDrawHUD), 18,
-                reinterpret_cast<void*>(&HookDrawHUD), reinterpret_cast<void**>(&g_origDrawHUD));
+    static const unsigned char kSigDpi[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20,
+        0x48, 0x8B, 0xF9, 0x48, 0x81};
+    InstallHook(game, "GameViewportDPIScale", kSigDpi, sizeof(kSigDpi), 15,
+                reinterpret_cast<void*>(&HookDpi), reinterpret_cast<void**>(&g_origDpi));
+
+    g_origArrange = reinterpret_cast<Arrange_t>(
+        reinterpret_cast<uintptr_t>(game) + 0x12D9EF4);
+    if (!HookVtableSlot(0x79ECA08, 71, 0x12D9EF4, reinterpret_cast<void*>(&HookArrange),
+                        "SOverlay::OnArrangeChildren")) {
+        LogLine("UI: arrange hook failed - disabled");
+        return;
+    }
+    LogLine("UI: SOverlay arrange hooked");
 }

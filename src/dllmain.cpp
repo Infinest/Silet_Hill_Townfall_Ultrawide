@@ -33,8 +33,18 @@ static LONG WINAPI VectoredExceptionLogger(EXCEPTION_POINTERS* ep) {
         HMODULE game = GetModuleHandleW(nullptr);
         uintptr_t base = reinterpret_cast<uintptr_t>(game);
         uintptr_t rip = ep->ContextRecord->Rip;
-        LogLine("CRASH code=%X rip=%llX gameoff=%llX addr=%llX", code,
-                (unsigned long long)rip, (unsigned long long)(rip - base),
+        HMODULE mod = nullptr;
+        char modName[64] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(rip), &mod)) {
+            GetModuleFileNameA(mod, modName, sizeof(modName));
+            const char* slash = strrchr(modName, '\\');
+            if (slash) memmove(modName, slash + 1, strlen(slash));
+        }
+        LogLine("CRASH code=%X rip=%llX mod=%s modoff=%llX addr=%llX", code,
+                (unsigned long long)rip, modName,
+                (unsigned long long)(rip - reinterpret_cast<uintptr_t>(mod)),
                 (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionInformation[1]);
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -109,7 +119,7 @@ static DWORD WINAPI InitThread(LPVOID) {
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
-        AddVectoredExceptionHandler(1, VectoredExceptionLogger);
+        // crash logger disabled: first-chance handler I/O can interfere with the game's own SEH-based probes
         LogLine("dxgi proxy attached (pid %lu)", GetCurrentProcessId());
         HANDLE h = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
         if (h) CloseHandle(h);
