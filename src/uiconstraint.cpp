@@ -56,8 +56,10 @@ bool ConfigAspect(double* out) {
 }
 
 bool gConstrain = false;
-bool gModify = false;  // phase 2: actually rewrite the geometry
+bool gModify = false;  // actually rewrite the geometry
 double gAspect = 16.0 / 9.0;
+int gAllowed[16] = {};
+int gAllowedCount = 0;
 bool gCfgLoaded = false;
 
 void LoadConfig() {
@@ -66,8 +68,56 @@ void LoadConfig() {
     gConstrain = ConfigInt(L"Constrain", 0) != 0;
     gModify = ConfigInt(L"Modify", 0) != 0;
     if (!ConfigAspect(&gAspect)) gAspect = 16.0 / 9.0;
-    LogLine("UI: Constrain=%d Modify=%d Aspect=%.4f", gConstrain ? 1 : 0, gModify ? 1 : 0,
-            gAspect);
+
+    wchar_t path[MAX_PATH], buf[128] = {};
+    HMODULE self;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&LoadConfig, &self)) {
+        GetModuleFileNameW(self, path, MAX_PATH);
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
+        GetPrivateProfileStringW(L"UI", L"AllowedStates", L"4", buf, 128, path);
+        wchar_t* ctx = nullptr;
+        for (wchar_t* tok = wcstok_s(buf, L", ;	", &ctx);
+             tok && gAllowedCount < 16; tok = wcstok_s(nullptr, L", ;	", &ctx)) {
+            gAllowed[gAllowedCount++] = _wtoi(tok);
+        }
+    }
+    LogLine("UI: Constrain=%d Modify=%d Aspect=%.4f AllowedStates=%d", gConstrain ? 1 : 0,
+            gModify ? 1 : 0, gAspect, gAllowedCount);
+}
+
+
+// ---- gameplay state gate (UTownfallGameInstance EGameState stack) ---------
+
+bool IsGamePtr(void* p);  // defined below
+
+void* gGameInstance = nullptr;
+int g_lastState = -2;
+
+int CurrentState() {
+    if (!gGameInstance) return -1;
+    if (!IsGamePtr(gGameInstance)) {
+        gGameInstance = nullptr;
+        return -1;
+    }
+    const char* data = *reinterpret_cast<const char**>(static_cast<char*>(gGameInstance) + 0x298);
+    const int count = *reinterpret_cast<const int*>(static_cast<char*>(gGameInstance) + 0x2a0);
+    if (!data || count <= 0 || count > 64) return -1;
+    return static_cast<unsigned char>(data[count - 1]);
+}
+
+bool GameplayGate() {
+    if (gAllowedCount == 0) return true;  // no filter configured: apply always
+    const int state = CurrentState();
+    if (state != g_lastState) {
+        LogLine("UI: game state -> %d", state);
+        g_lastState = state;
+    }
+    for (int i = 0; i < gAllowedCount; ++i)
+        if (gAllowed[i] == state) return true;
+    return false;
 }
 
 // ---- context capture (SGameLayerManager -> UGameViewportClient) -----------
@@ -101,7 +151,7 @@ bool IsGamePtr(void* p) {
 int gCaptureAttempts = 0;
 
 void CaptureContext(void* manager) {
-    if (gViewportOverlay || !gAttrGet || gCaptureAttempts >= 400) return;
+    if (!gAttrGet || gCaptureAttempts >= 400) return;
     ++gCaptureAttempts;
     if (!IsGamePtr(manager)) return;
 
@@ -114,16 +164,21 @@ void CaptureContext(void* manager) {
     }
     if (attrSlot && reinterpret_cast<uintptr_t>(attrSlot) > 0x10000)
         fsv = *reinterpret_cast<void**>(attrSlot);
-    if (gCaptureAttempts <= 6)
-        LogLine("UI: hops manager=%llX attr=%llX fsv=%llX", (unsigned long long)(uintptr_t)manager,
-                (unsigned long long)(uintptr_t)attrSlot, (unsigned long long)(uintptr_t)fsv);
     if (!IsGamePtr(fsv)) return;
     void* gvc = *reinterpret_cast<void**>(static_cast<char*>(fsv) + 0x38);
-    if (!IsGamePtr(gvc)) return;
-    void* overlay = *reinterpret_cast<void**>(static_cast<char*>(gvc) + 0x120);
-    if (!IsGamePtr(overlay)) return;
-    gViewportOverlay = overlay;
-    LogLine("UI: viewport overlay captured %llX", (unsigned long long)(uintptr_t)overlay);
+    if (!IsGamePtr(gvc)) {
+        if (gCaptureAttempts == 30 || gCaptureAttempts == 120 || gCaptureAttempts == 300)
+            LogLine("UI: hop gvc rejected fsv=%llX gvc=%llX",
+                    (unsigned long long)(uintptr_t)fsv, (unsigned long long)(uintptr_t)gvc);
+        return;
+    }
+    if (gViewportOverlay == nullptr) {
+        void* overlay = *reinterpret_cast<void**>(static_cast<char*>(gvc) + 0x120);
+        if (IsGamePtr(overlay)) {
+            gViewportOverlay = overlay;
+            LogLine("UI: viewport overlay captured %llX", (unsigned long long)(uintptr_t)overlay);
+        }
+    }
 }
 
 // AddSlot instance counting: the ViewportOverlay is the SOverlay that
@@ -176,6 +231,21 @@ float HookDpi(void* manager) {
     return g_origDpi(manager);
 }
 
+// ---- GameInstance capture (UTownfallGameInstance::PopGameState) -----------
+
+using PopState_t = void (*)(void* this_, unsigned char state);
+
+PopState_t g_origPop = nullptr;
+
+void HookPop(void* this_, unsigned char state) {
+    while (!g_origPop) Sleep(0);
+    if (gGameInstance == nullptr && IsGamePtr(this_)) {
+        gGameInstance = this_;
+        LogLine("UI: game instance captured %llX", (unsigned long long)(uintptr_t)this_);
+    }
+    g_origPop(this_, state);
+}
+
 // ---- SOverlay::OnArrangeChildren (vtable slot 71) -------------------------
 
 volatile LONG g_arrangeLogs = 0;
@@ -207,7 +277,7 @@ void HookArrange(void* this_, void* geo, void* arranged) {
             lastCandidateHits = 1;
         }
     }
-    if (gConstrain && this_ == gViewportOverlay && gModify) {
+    if (gConstrain && this_ == gViewportOverlay && gModify && GameplayGate()) {
         // Present the children a centered box. FGeometry (double precision):
         //   +0x00 Size, +0x10 Position, +0x20 AbsolutePosition (FVector2D
         //   doubles each), +0x30 AbsoluteScale.
@@ -293,6 +363,14 @@ void InstallUIConstraint(HMODULE game) {
         0x48, 0x8B, 0xF9, 0x48, 0x81};
     InstallHook(game, "GameViewportDPIScale", kSigDpi, sizeof(kSigDpi), 15,
                 reinterpret_cast<void*>(&HookDpi), reinterpret_cast<void**>(&g_origDpi));
+
+    // PopGameState: rcx = UTownfallGameInstance on every state transition.
+    // 15-byte rsp-relative prologue, no branches (trampoline-safe).
+    static const unsigned char kSigPop[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57,
+        0x48, 0x83, 0xEC, 0x20, 0x0F, 0xB6, 0xDA, 0x48, 0x8B, 0xF9};
+    InstallHook(game, "PopGameState", kSigPop, sizeof(kSigPop), 15,
+                reinterpret_cast<void*>(&HookPop), reinterpret_cast<void**>(&g_origPop));
 
     g_origArrange = reinterpret_cast<Arrange_t>(
         reinterpret_cast<uintptr_t>(game) + 0x12D9EF4);
