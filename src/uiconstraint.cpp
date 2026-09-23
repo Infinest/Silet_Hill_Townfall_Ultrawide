@@ -201,9 +201,8 @@ void HookArrange(void* this_, void* geo, void* arranged) {
     // yet: the viewport overlay is the SOverlay arranged with a
     // full-display-width geometry.
     if (gViewportOverlay == nullptr) {
-        double d[2] = {};
-        memcpy(d, geo, sizeof(d));
-        if (d[0] > 3000.0 && d[0] < 20000.0) {
+        float w = *reinterpret_cast<float*>(geo);
+        if (w > 3000.f && w < 20000.f) {
             int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
             if (slots >= 2) {
                 static void* lastCandidate = nullptr;
@@ -228,7 +227,8 @@ void HookArrange(void* this_, void* geo, void* arranged) {
         char* g = static_cast<char*>(geo);
         const float W = *reinterpret_cast<float*>(g + 0x00);
         const float H = *reinterpret_cast<float*>(g + 0x04);
-        if (W > 0.f && H > 0.f) {
+        const float scale = *reinterpret_cast<float*>(g + 0x08);
+        if (W > 0.f && H > 0.f && scale > 0.f) {
             float boxW, boxH;
             if (static_cast<double>(W) / H > gAspect) {
                 boxH = H;
@@ -237,18 +237,20 @@ void HookArrange(void* this_, void* geo, void* arranged) {
                 boxW = W;
                 boxH = static_cast<float>(W / gAspect);
             }
-            const float ox = (W - boxW) / 2.f;
+            const float ox = (W - boxW) / 2.f;   // box origin, local units
             const float oy = (H - boxH) / 2.f;
+            const float oxAbs = ox * scale;      // AbsolutePosition/render
+            const float oyAbs = oy * scale;      //   transform are in px
             char copy[0x60];
             memcpy(copy, geo, sizeof(copy));
             *reinterpret_cast<float*>(copy + 0x00) = boxW;
             *reinterpret_cast<float*>(copy + 0x04) = boxH;
-            *reinterpret_cast<float*>(copy + 0x0C) += ox;  // AbsolutePosition
-            *reinterpret_cast<float*>(copy + 0x10) += oy;
-            *reinterpret_cast<float*>(copy + 0x14) += ox;  // Position
+            *reinterpret_cast<float*>(copy + 0x0C) += oxAbs;  // AbsolutePosition
+            *reinterpret_cast<float*>(copy + 0x10) += oyAbs;
+            *reinterpret_cast<float*>(copy + 0x14) += ox;  // Position (local)
             *reinterpret_cast<float*>(copy + 0x18) += oy;
-            *reinterpret_cast<float*>(copy + 0x2C) += ox;  // AccumulatedRender
-            *reinterpret_cast<float*>(copy + 0x30) += oy;  //   Transform translation
+            *reinterpret_cast<float*>(copy + 0x2C) += oxAbs;  // AccumulatedRender
+            *reinterpret_cast<float*>(copy + 0x30) += oyAbs;  //   Transform translation
             g_origArrange(this_, copy, arranged);
             return;
         }
