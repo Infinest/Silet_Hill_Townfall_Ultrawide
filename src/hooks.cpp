@@ -26,8 +26,30 @@ using CalcProj_t = void (*)(void* fmi, unsigned char constraint, void* viewport,
 CalcProj_t g_origCalcProj = nullptr;
 
 void HookCalcProj(void* fmi, unsigned char constraint, void* viewport, unsigned char* viewInit) {
+    // Cameras with bConstrainAspectRatio (bit 0 of the FMinimalViewInfo flag
+    // dword at +0x68) get a projection matrix built for the camera's authored
+    // AspectRatio property (M00 = M11 / aspectProp) instead of the real view
+    // rect aspect. The engine's matching pillarbox rect was already disabled
+    // by the CalculateViewExtents patch; without clearing this flag the
+    // authored-aspect image would be stretched across the full 32:9 viewport.
+    // Clearing the bit makes every camera project with M00 = M11 / rectAspect.
     unsigned* flags = reinterpret_cast<unsigned*>(static_cast<char*>(fmi) + 0x68);
     *flags &= ~1u;
+
+    // Cutscene cameras use constraint 1 (MaintainXFOV): the FOV property is
+    // the HORIZONTAL FOV and the engine derives the vertical half-angle from
+    // the real view rect, vHalf = atan(tan(FOV/2) / rectAspect). Rendered
+    // into the full 32:9 rect that crops the vertical FOV (zoomed-in image).
+    // Gameplay cameras use constraint 0 with an authored AspectRatio property
+    // (+0x5c), which yields the rect-independent vertical FOV
+    //   2*atan(tan(FOV/2) / aspectProp)
+    // - exactly the authored vertical framing. Switching cutscene cameras to
+    // constraint 0 (only when an authored aspect exists) therefore preserves
+    // the authored vertical FOV and only widens the picture horizontally.
+    if (constraint == 1) {
+        const float aspect = *reinterpret_cast<float*>(static_cast<char*>(fmi) + 0x5c);
+        if (aspect > 0.f) constraint = 0;
+    }
     g_origCalcProj(fmi, constraint, viewport, viewInit);
 }
 
