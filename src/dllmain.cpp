@@ -13,12 +13,19 @@
 // All offsets are located at runtime by pattern scanning, so game updates that
 // move code will not corrupt anything - the patch simply refuses to apply.
 //
-// This build also installs temporary diagnostic hooks (hooks.cpp) that log
-// camera FOV, aspect-ratio properties, view rects and the resulting projection
-// matrix to TownfallUltraWide.log. They are installed before the patch is
-// applied so early (pre-patch) frames are captured as well.
+// A hook on FMinimalViewInfo::CalculateProjectionMatrixGivenView (hooks.cpp)
+// complements the patch: cameras with bConstrainAspectRatio would otherwise
+// get a projection matrix built for the authored aspect property and the
+// image would stretch across the full 32:9 viewport.
+//
+// Configuration (TownfallUltraWide.ini, next to this DLL):
+//   [Camera] Enabled  0/1 - master switch for the 32:9 gameplay fix
+//   [UI]     Constrain 0/1/2 - off / 16:9 HUD box / 21:9 HUD box (gameplay only)
+// The ini is generated with defaults on first launch if it does not exist.
 
 #include <windows.h>
+
+#include <cstring>
 
 #include "log.h"
 #include "patch.h"
@@ -50,36 +57,61 @@ static LONG WINAPI VectoredExceptionLogger(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void InstallDiagnosticHooks(HMODULE game);
+void InstallCameraHooks(HMODULE game);
 void InstallUIConstraint(HMODULE game);
 
-static bool ConfigEnabled() {
-    wchar_t path[MAX_PATH];
-    HMODULE self;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)&ConfigEnabled, &self)) {
-        GetModuleFileNameW(self, path, MAX_PATH);
-        wchar_t* slash = wcsrchr(path, L'\\');
-        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
-    } else {
-        return true;
-    }
-    return GetPrivateProfileIntW(L"Patch", L"Enabled", 1, path) != 0;
-}
-
-static bool HookEnabled(LPCWSTR name) {
-    wchar_t path[MAX_PATH];
+static void IniPath(wchar_t* path) {
     HMODULE self;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCWSTR)&HookEnabled, &self)) {
-        return true;
+                            (LPCWSTR)&IniPath, &self)) {
+        path[0] = L'\0';
+        return;
     }
     GetModuleFileNameW(self, path, MAX_PATH);
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
-    return GetPrivateProfileIntW(L"Hooks", name, 1, path) != 0;
+}
+
+// Write a default ini with explanations if the user has none yet.
+static void EnsureDefaultIni() {
+    wchar_t path[MAX_PATH];
+    IniPath(path);
+    if (!path[0] || GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) return;
+
+    static const char kDefaultIni[] =
+        "; Townfall UltraWide mod - configuration\r\n"
+        "; Generated automatically. Delete this file to reset to defaults.\r\n"
+        "\r\n"
+        "[Camera]\r\n"
+        "; 0 - off, 1 - on\r\n"
+        "; Unlocks super ultrawide (32:9) gameplay by removing the 21:9 aspect\r\n"
+        "; cap and pillarboxing. Vertical FOV stays as authored for 16:9, so\r\n"
+        "; the image is never stretched.\r\n"
+        "Enabled=1\r\n"
+        "\r\n"
+        "[UI]\r\n"
+        "; Constrain: 0 - off, the HUD spans the full screen width\r\n"
+        ";            1 - constrain the in-game HUD to a centered 16:9 box\r\n"
+        ";            2 - constrain the in-game HUD to a centered 21:9 box\r\n"
+        "; Applies only during gameplay. Main menu, inventory and pause\r\n"
+        "; screens always use the full screen width.\r\n"
+        "Constrain=1\r\n";
+
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, kDefaultIni, sizeof(kDefaultIni) - 1, &written, nullptr);
+    CloseHandle(f);
+    LogLine("default TownfallUltraWide.ini created");
+}
+
+static bool CameraEnabled() {
+    wchar_t path[MAX_PATH];
+    IniPath(path);
+    if (!path[0]) return true;
+    return GetPrivateProfileIntW(L"Camera", L"Enabled", 1, path) != 0;
 }
 
 static DWORD WINAPI InitThread(LPVOID) {
@@ -93,13 +125,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     // captured early.
     InstallUIConstraint(game);
 
-    // Diagnostic instrumentation first: captures pre-patch behavior too.
-    InstallDiagnosticHooks(game);
-
-    if (!ConfigEnabled()) {
-        LogLine("Patch disabled via TownfallUltraWide.ini");
+    if (!CameraEnabled()) {
+        LogLine("camera fix disabled via TownfallUltraWide.ini");
         return 0;
     }
+
+    // The projection hook must be in place before the first constrained
+    // camera renders, so install it before applying the byte patch.
+    InstallCameraHooks(game);
 
     const PatchResult result = ApplyUltrawidePatch(game);
     switch (result) {
@@ -121,6 +154,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hinst);
         // crash logger disabled: first-chance handler I/O can interfere with the game's own SEH-based probes
         LogLine("dxgi proxy attached (pid %lu)", GetCurrentProcessId());
+        EnsureDefaultIni();
         HANDLE h = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
         if (h) CloseHandle(h);
     }

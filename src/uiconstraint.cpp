@@ -23,7 +23,7 @@
 
 namespace {
 
-bool ConfigInt(LPCWSTR key, int def) {
+int ConfigInt(LPCWSTR key, int def) {
     wchar_t path[MAX_PATH];
     HMODULE self;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -37,55 +37,18 @@ bool ConfigInt(LPCWSTR key, int def) {
     return GetPrivateProfileIntW(L"UI", key, def, path);
 }
 
-bool ConfigAspect(double* out) {
-    wchar_t path[MAX_PATH], buf[32] = {};
-    HMODULE self;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            (LPCWSTR)&ConfigAspect, &self)) {
-        return false;
-    }
-    GetModuleFileNameW(self, path, MAX_PATH);
-    wchar_t* slash = wcsrchr(path, L'\\');
-    if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
-    GetPrivateProfileStringW(L"UI", L"Aspect", L"16:9", buf, 32, path);
-    int w = 0, h = 0;
-    if (swscanf_s(buf, L"%d:%d", &w, &h) != 2 || w <= 0 || h <= 0) return false;
-    *out = static_cast<double>(w) / h;
-    return true;
-}
-
-bool gConstrain = false;
-bool gModify = false;  // actually rewrite the geometry
+// Constrain: 0 = off, 1 = centered 16:9 box, 2 = centered 21:9 box.
+int gConstrain = 0;
 double gAspect = 16.0 / 9.0;
-int gAllowed[16] = {};
-int gAllowedCount = 0;
 bool gCfgLoaded = false;
 
 void LoadConfig() {
     if (gCfgLoaded) return;
     gCfgLoaded = true;
-    gConstrain = ConfigInt(L"Constrain", 0) != 0;
-    gModify = ConfigInt(L"Modify", 0) != 0;
-    if (!ConfigAspect(&gAspect)) gAspect = 16.0 / 9.0;
-
-    wchar_t path[MAX_PATH], buf[128] = {};
-    HMODULE self;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)&LoadConfig, &self)) {
-        GetModuleFileNameW(self, path, MAX_PATH);
-        wchar_t* slash = wcsrchr(path, L'\\');
-        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
-        GetPrivateProfileStringW(L"UI", L"AllowedStates", L"4", buf, 128, path);
-        wchar_t* ctx = nullptr;
-        for (wchar_t* tok = wcstok_s(buf, L", ;	", &ctx);
-             tok && gAllowedCount < 16; tok = wcstok_s(nullptr, L", ;	", &ctx)) {
-            gAllowed[gAllowedCount++] = _wtoi(tok);
-        }
-    }
-    LogLine("UI: Constrain=%d Modify=%d Aspect=%.4f AllowedStates=%d", gConstrain ? 1 : 0,
-            gModify ? 1 : 0, gAspect, gAllowedCount);
+    gConstrain = ConfigInt(L"Constrain", 1);
+    if (gConstrain < 0 || gConstrain > 2) gConstrain = 1;
+    gAspect = (gConstrain == 2) ? 21.0 / 9.0 : 16.0 / 9.0;
+    LogLine("UI: Constrain=%d", gConstrain);
 }
 
 
@@ -109,15 +72,14 @@ int CurrentState() {
 }
 
 bool GameplayGate() {
-    if (gAllowedCount == 0) return true;  // no filter configured: apply always
+    // The HUD is constrained only while the game-state stack top is 4
+    // (gameplay). Menus, loading, inventory and pause push other states.
     const int state = CurrentState();
     if (state != g_lastState) {
         LogLine("UI: game state -> %d", state);
         g_lastState = state;
     }
-    for (int i = 0; i < gAllowedCount; ++i)
-        if (gAllowed[i] == state) return true;
-    return false;
+    return state == 4;
 }
 
 // ---- context capture (SGameLayerManager -> UGameViewportClient) -----------
@@ -166,12 +128,7 @@ void CaptureContext(void* manager) {
         fsv = *reinterpret_cast<void**>(attrSlot);
     if (!IsGamePtr(fsv)) return;
     void* gvc = *reinterpret_cast<void**>(static_cast<char*>(fsv) + 0x38);
-    if (!IsGamePtr(gvc)) {
-        if (gCaptureAttempts == 30 || gCaptureAttempts == 120 || gCaptureAttempts == 300)
-            LogLine("UI: hop gvc rejected fsv=%llX gvc=%llX",
-                    (unsigned long long)(uintptr_t)fsv, (unsigned long long)(uintptr_t)gvc);
-        return;
-    }
+    if (!IsGamePtr(gvc)) return;
     if (gViewportOverlay == nullptr) {
         void* overlay = *reinterpret_cast<void**>(static_cast<char*>(gvc) + 0x120);
         if (IsGamePtr(overlay)) {
@@ -188,7 +145,6 @@ struct SlotCount {
     int count;
 };
 SlotCount g_slotCounts[32] = {};
-volatile LONG g_addSlotCalls = 0;
 
 void* HookAddSlot(void* this_, void* slotArgs) {
     while (!g_origAddSlot) Sleep(0);
@@ -202,14 +158,6 @@ void* HookAddSlot(void* this_, void* slotArgs) {
                 sc.instance = this_;
                 sc.count = 1;
                 break;
-            }
-        }
-        LONG n = InterlockedIncrement(&g_addSlotCalls);
-        if (n == 12 || n == 60) {
-            for (auto& sc : g_slotCounts) {
-                if (sc.instance)
-                    LogLine("UI: addslot %llX x%d", (unsigned long long)(uintptr_t)sc.instance,
-                            sc.count);
             }
         }
         // the first instance to reach 4 add-slot calls is almost certainly the
@@ -248,36 +196,28 @@ void HookPop(void* this_, unsigned char state) {
 
 // ---- SOverlay::OnArrangeChildren (vtable slot 71) -------------------------
 
-volatile LONG g_arrangeLogs = 0;
-
 void HookArrange(void* this_, void* geo, void* arranged) {
-    // Identify the viewport overlay empirically: it is the SOverlay arranged
-    // with a full-display-width geometry.
-    double d[8] = {};
-    memcpy(d, geo, sizeof(d));
-    if (gConstrain && InterlockedIncrement(&g_arrangeLogs) <= 10) {
-        int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
-        LogLine("UI: arrange this=%llX geo=%.0f %.0f | %.0f %.0f | %f %f | %f %f slots=%d",
-                (unsigned long long)(uintptr_t)this_, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-                slots);
-    }
-    if (gConstrain && gViewportOverlay == nullptr && d[0] > 3000.0 && d[0] < 20000.0) {
-        int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
-        if (slots >= 2 && InterlockedIncrement(&g_arrangeLogs) <= 10)
-            LogLine("UI: candidate overlay=%llX geo=%f %f | %f %f | %f %f | %f %f slots=%d",
-                    (unsigned long long)(uintptr_t)this_, d[0], d[1], d[2], d[3], d[4], d[5], d[6],
-                    d[7], slots);
-        // the first persistent full-width overlay with several children wins
-        static void* lastCandidate = nullptr;
-        static int lastCandidateHits = 0;
-        if (this_ == lastCandidate) {
-            if (++lastCandidateHits >= 5) gViewportOverlay = this_;
-        } else {
-            lastCandidate = this_;
-            lastCandidateHits = 1;
+    // Fallback overlay identification if the AddSlot path has not found it
+    // yet: the viewport overlay is the SOverlay arranged with a
+    // full-display-width geometry.
+    if (gViewportOverlay == nullptr) {
+        double d[2] = {};
+        memcpy(d, geo, sizeof(d));
+        if (d[0] > 3000.0 && d[0] < 20000.0) {
+            int slots = *reinterpret_cast<int*>(static_cast<char*>(this_) + 0x200);
+            if (slots >= 2) {
+                static void* lastCandidate = nullptr;
+                static int lastCandidateHits = 0;
+                if (this_ == lastCandidate) {
+                    if (++lastCandidateHits >= 5) gViewportOverlay = this_;
+                } else {
+                    lastCandidate = this_;
+                    lastCandidateHits = 1;
+                }
+            }
         }
     }
-    if (gConstrain && this_ == gViewportOverlay && gModify && GameplayGate()) {
+    if (this_ == gViewportOverlay && GameplayGate()) {
         // Present the children a centered box. FGeometry (double precision):
         //   +0x00 Size, +0x10 Position, +0x20 AbsolutePosition (FVector2D
         //   doubles each), +0x30 AbsoluteScale.
@@ -338,8 +278,8 @@ bool HookVtableSlot(uintptr_t vtableRva, int slot, uintptr_t expectedTarget, voi
 
 void InstallUIConstraint(HMODULE game) {
     LoadConfig();
-    if (!ConfigInt(L"Enabled", 1)) {
-        LogLine("UI: module disabled via ini");
+    if (gConstrain == 0) {
+        LogLine("UI: constraint off (Constrain=0)");
         return;
     }
 

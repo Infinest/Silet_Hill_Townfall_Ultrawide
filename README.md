@@ -1,9 +1,14 @@
-# Townfall Super Ultrawide (32:9) Gameplay Fix
+# Townfall Super Ultrawide (32:9) Mod
 
 Removes the 21:9 gameplay restriction in *Silent Hill: Townfall* (Steam, UE 5.6.1)
 so the full 32:9 viewport is rendered during gameplay, without stretching and
 with the authored vertical FOV. Menus already supported 32:9; gameplay was
 pillarboxed to 21:9.
+
+Optionally, the in-game HUD can be constrained to a centered 16:9 (or 21:9)
+safe area so all HUD elements are visible without turning your head. This
+applies only during gameplay — main menu, inventory and pause screens always
+use the full width.
 
 ## How it works
 
@@ -31,8 +36,14 @@ clamp is enforced in **two coordinated places**, and the mod touches both:
 Combined result at 5120x1440: full-width rendering, horizontal FOV widens
 exactly by the aspect ratio, and vertical FOV stays at the authored value —
 identical vertical framing to the stock 21:9 mode, without bars or stretch.
-Verified in-engine: `M11 = cot(vHalf)` and `M00 = M11 / 3.5556` for all
-cameras (logged via the diagnostic hook).
+
+**HUD constraint (step 2).** The visible HUD is Slate/UMG parented under the
+viewport overlay (`SOverlay`). A vtable hook on `SOverlay::OnArrangeChildren`
+(slot 71) presents the overlay's children a modified `FGeometry` — a centered
+box instead of the full 32:9 rect — so every HUD widget lays itself out
+inside the box without touching a single draw call. The constraint is gated to
+gameplay by watching `UTownfallGameInstance`'s game-state stack (captured via
+a trampoline hook on `PopGameState`): only state 4 (gameplay) gets the box.
 
 All patch sites are located at runtime by pattern scanning; the game exe on
 disk is never modified. If a game update moves the code, the patch refuses to
@@ -45,6 +56,9 @@ DLL).
    `E:\SteamLibrary\steamapps\common\Townfall\Townfall\Binaries\Win64\`
 2. Start the game normally (through Steam).
 
+On first launch the mod creates `TownfallUltraWide.ini` with defaults next to
+the DLL.
+
 Uninstall: delete `dxgi.dll` (and optionally `TownfallUltraWide.log` /
 `TownfallUltraWide.ini`). Steam file verification is not affected - the DLL is
 not part of the game manifest.
@@ -55,39 +69,39 @@ loaded by full system path.
 
 ## Config (optional)
 
-`TownfallUltraWide.ini` next to the DLL:
+`TownfallUltraWide.ini` next to the DLL (delete it to reset to defaults):
 
 ```ini
-[Patch]
-Enabled=1      ; 0 = disable everything (game runs 100% stock)
-FixMatrix=1    ; 0 = only remove the pillarbox bars (keeps authored-aspect
-               ;     projection -> stretched image; useful for comparison)
-
-[Hooks]
-; Diagnostic logging hooks (all default off except CalcProj, which carries
-; the FixMatrix logic). Only enable for debugging.
+[Camera]
+; 0 - off, 1 - on
+; Unlocks super ultrawide (32:9) gameplay by removing the 21:9 aspect
+; cap and pillarboxing. Vertical FOV stays as authored for 16:9, so
+; the image is never stretched.
 Enabled=1
-CalcProj=1
-GetCameraView=0
-CalcViewExtents=0
+
+[UI]
+; Constrain: 0 - off, the HUD spans the full screen width
+;            1 - constrain the in-game HUD to a centered 16:9 box
+;            2 - constrain the in-game HUD to a centered 21:9 box
+; Applies only during gameplay. Main menu, inventory and pause
+; screens always use the full screen width.
+Constrain=1
 ```
 
-## Known notes / roadmap
+## Known notes
 
 - Cutscene letterboxing that uses the same constraint is also lifted; pre-
   rendered FMVs keep their baked-in bars.
-- **Planned (step 2, pending user confirmation):** constrain the in-game HUD
-  to a centered 16:9 safe area so all UI is visible without turning your head.
 
 ## Project layout
 
 ```
 build.bat            - MSVC build script -> dist\dxgi.dll
 src/
-  dllmain.cpp        - entry point, config, init thread
+  dllmain.cpp        - entry point, default-ini generation, config, init thread
   patch.cpp/.h       - pattern scan + 1-byte patch of CalculateViewExtents
-  hooks.cpp          - detour hooks (CalcProj carries the matrix fix;
-                       optional diagnostic logging of FOV/rects/matrix)
+  hooks.cpp          - camera hook (clears bConstrainAspectRatio in CalcProj)
+  uiconstraint.cpp   - HUD box: SOverlay arrange-hook + gameplay state gate
   detour.cpp/.h      - absolute-jump detour helper (r11-preserving trampolines)
   log.cpp/.h         - lock-free WriteFile logger (no CRT stdio; render-thread safe)
   dxgi_exports.cpp   - proxy exports forwarded to system dxgi.dll
