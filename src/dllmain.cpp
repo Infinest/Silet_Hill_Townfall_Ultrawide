@@ -6,21 +6,20 @@
 // (bConstrainAspectRatio, e.g. the 21:9 gameplay clamp).
 //
 // This DLL is dropped into Townfall\Binaries\Win64 as dxgi.dll (Windows loads
-// it for the D3D12 renderer) and patches one conditional jump in that function
-// so the constraint math always takes the "leave the rect unchanged" path.
-// Result: the full 32:9 viewport is used during gameplay.
+// it for the D3D12 renderer) and installs two hooks (hooks.cpp): the view rect
+// is handed through unchanged for normal cameras (full 32:9 viewport), and the
+// projection matrix is built from the real view rect aspect instead of the
+// camera's authored aspect property (which would stretch the image).
 //
-// All offsets are located at runtime by pattern scanning, so game updates that
-// move code will not corrupt anything - the patch simply refuses to apply.
-//
-// A hook on FMinimalViewInfo::CalculateProjectionMatrixGivenView (hooks.cpp)
-// complements the patch: cameras with bConstrainAspectRatio would otherwise
-// get a projection matrix built for the authored aspect property and the
-// image would stretch across the full 32:9 viewport.
+// All hook sites are located at runtime by pattern scanning, so game updates
+// that move code will not corrupt anything - the hooks simply refuse to
+// install and the game runs unmodified.
 //
 // Configuration (TownfallUltraWide.ini, next to this DLL):
-//   [Camera] Enabled  0/1 - master switch for the 32:9 gameplay fix
-//   [UI]     Constrain 0/1/2 - off / 16:9 HUD box / 21:9 HUD box (gameplay only)
+//   [Camera] Enabled             0/1 - master switch for the 32:9 gameplay fix
+//   [Camera] DisableInCutscenes  0/1 - leave cutscenes vanilla (pillarboxed)
+//   [UI]     Constrain           0/1/2 - off / 16:9 HUD box / 21:9 HUD box
+//                                      (gameplay only)
 // The ini is generated with defaults on first launch if it does not exist.
 
 #include <windows.h>
@@ -28,7 +27,6 @@
 #include <cstring>
 
 #include "log.h"
-#include "patch.h"
 
 // First-chance logger for fatal exceptions: records code + RIP (module
 // offset) so crashes in the game can be mapped to the exact instruction
@@ -90,6 +88,11 @@ static void EnsureDefaultIni() {
         "; the image is never stretched.\r\n"
         "Enabled=1\r\n"
         "\r\n"
+        "; 0 - off, 1 - on\r\n"
+        "; Renders cutscenes like the unpatched game (pillarboxed to the\r\n"
+        "; camera's authored aspect) instead of full super ultrawide width.\r\n"
+        "DisableInCutscenes=0\r\n"
+        "\r\n"
         "[UI]\r\n"
         "; Constrain: 0 - off, the HUD spans the full screen width\r\n"
         ";            1 - constrain the in-game HUD to a centered 16:9 box\r\n"
@@ -136,22 +139,11 @@ static DWORD WINAPI InitThread(LPVOID) {
         return 0;
     }
 
-    // The projection hook must be in place before the first constrained
-    // camera renders, so install it before applying the byte patch.
+    // The camera hooks replace the former byte patch: they keep the view rect
+    // full-width for normal cameras and leave cutscenes vanilla when
+    // [Camera] DisableInCutscenes=1.
     InstallCameraHooks(game);
-
-    const PatchResult result = ApplyUltrawidePatch(game);
-    switch (result) {
-        case PatchResult::Applied:
-            LogLine("OK: 32:9 gameplay patch applied (FViewport::CalculateViewExtents neutralized)");
-            break;
-        case PatchResult::PatternNotFound:
-            LogLine("ERROR: pattern not found - game version changed? Patch NOT applied.");
-            break;
-        case PatchResult::PatternNotUnique:
-            LogLine("ERROR: pattern not unique - refusing to patch.");
-            break;
-    }
+    LogLine("OK: 32:9 camera hooks installed");
     return 0;
 }
 

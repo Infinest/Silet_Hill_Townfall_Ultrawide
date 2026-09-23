@@ -14,24 +14,34 @@ use the full width.
 
 The game ships with full debug symbols (`Townfall-Win64-Shipping.pdb`), which
 made it possible to pinpoint the exact engine functions responsible. The 21:9
-clamp is enforced in **two coordinated places**, and the mod touches both:
+clamp is enforced in **two coordinated places**, and the mod hooks both
+(runtime pattern scanning only - the exe on disk is never modified, and if a
+game update moves the code the hooks refuse to install):
 
 1. **View-rect constraint** — `FViewport::CalculateViewExtents`
    (RVA `0x1798174`) shrinks the render rectangle (the black pillarbox bars)
-   when the camera's aspect-ratio constraint binds. The mod flips one
-   conditional jump (`jbe` → `jmp` at RVA `0x17981E2`) so the rectangle always
-   stays full-size.
+   when the camera's aspect-ratio constraint binds. A hook hands the rect
+   through unchanged for normal cameras (full 32:9); with
+   `DisableInCutscenes=1` the original engine function runs for cutscene
+   cameras, reproducing the vanilla pillarbox exactly.
 
 2. **Projection matrix** — for cameras with `bConstrainAspectRatio`, UE builds
    the projection with the camera's *authored* aspect ratio
    (`UCameraComponent::AspectRatio`, e.g. 2.35) instead of the real view-rect
-   aspect: `M00 = M11 / aspectProp`. The authored-aspect frame used to land
-   inside the pillarboxed rect; with the bars gone it was stretched across the
-   whole 32:9 screen. A hook on
+   aspect: `M00 = M11 / aspectProp`. With the bars gone that image would
+   stretch across the whole 32:9 screen, so a hook on
    `FMinimalViewInfo::CalculateProjectionMatrixGivenView` clears
    `bConstrainAspectRatio` (bit 0 of the flag dword at FMinimalViewInfo+0x68)
-   before the matrix is built, so every camera projects with
+   for normal cameras, making every camera project with
    `M00 = M11 / rectAspect`.
+
+Cutscene cameras use constraint 1 (MaintainXFOV): the FOV property is the
+horizontal FOV and the vertical FOV is derived from the real view rect, so
+rendering them into the full 32:9 rect would crop the vertical FOV
+(zoomed-in image). They are switched to constraint 0, which yields the
+rect-independent authored vertical FOV `2*atan(tan(FOV/2)/aspectProp)` — the
+picture only widens horizontally, identical to gameplay framing. With
+`DisableInCutscenes=1` cutscene cameras are left 100% vanilla instead.
 
 Combined result at 5120x1440: full-width rendering, horizontal FOV widens
 exactly by the aspect ratio, and vertical FOV stays at the authored value —
@@ -45,10 +55,10 @@ inside the box without touching a single draw call. The constraint is gated to
 gameplay by watching `UTownfallGameInstance`'s game-state stack (captured via
 a trampoline hook on `PopGameState`): only state 4 (gameplay) gets the box.
 
-All patch sites are located at runtime by pattern scanning; the game exe on
-disk is never modified. If a game update moves the code, the patch refuses to
-apply and the game runs unmodified (see `TownfallUltraWide.log` next to the
-DLL).
+All hook sites are located at runtime by pattern scanning; the game exe on
+disk is never modified. If a game update moves the code, the hooks refuse to
+install and the game runs unmodified (enable `[Log] Enabled=1` and check
+`TownfallUltraWide.log` next to the DLL).
 
 ## Install
 
@@ -79,6 +89,11 @@ loaded by full system path.
 ; the image is never stretched.
 Enabled=1
 
+; 0 - off, 1 - on
+; Renders cutscenes like the unpatched game (pillarboxed to the
+; camera's authored aspect) instead of full super ultrawide width.
+DisableInCutscenes=0
+
 [UI]
 ; Constrain: 0 - off, the HUD spans the full screen width
 ;            1 - constrain the in-game HUD to a centered 16:9 box
@@ -96,8 +111,10 @@ Enabled=0
 
 ## Known notes
 
-- Cutscene letterboxing that uses the same constraint is also lifted; pre-
-  rendered FMVs keep their baked-in bars.
+- Pre-rendered FMVs keep their baked-in bars regardless of the settings above.
+- With `DisableInCutscenes=1` cutscenes are pixel-identical to the unpatched
+  game (vanilla pillarbox); with `0` they render full 32:9 with the authored
+  vertical FOV.
 
 ## Project layout
 
@@ -105,11 +122,11 @@ Enabled=0
 build.bat            - MSVC build script -> dist\dxgi.dll
 src/
   dllmain.cpp        - entry point, default-ini generation, config, init thread
-  patch.cpp/.h       - pattern scan + 1-byte patch of CalculateViewExtents
-  hooks.cpp          - camera hook (clears bConstrainAspectRatio in CalcProj)
+  hooks.cpp          - camera hooks: conditional view-rect pass-through,
+                       projection flag clear, cutscene FOV/vanilla handling
   uiconstraint.cpp   - HUD box: SOverlay arrange-hook + gameplay state gate
   detour.cpp/.h      - absolute-jump detour helper (r11-preserving trampolines)
-  log.cpp/.h         - lock-free WriteFile logger (no CRT stdio; render-thread safe)
+  log.cpp/.h         - lock-free WriteFile logger (opt-in via [Log] Enabled)
   dxgi_exports.cpp   - proxy exports forwarded to system dxgi.dll
 tools/               - reversing + test toolchain
   resolve/dump_all/layout  - DbgHelp symbol tools (uses the shipped PDB)
