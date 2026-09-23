@@ -96,7 +96,7 @@ static void EnsureDefaultIni() {
         ";            2 - constrain the in-game HUD to a centered 21:9 box\r\n"
         "; Applies only during gameplay. Main menu, inventory and pause\r\n"
         "; screens always use the full screen width.\r\n"
-        "Constrain=1\r\n"
+        "Constrain=0\r\n"
         "\r\n"
         "[Log]\r\n"
         "; 0 - off, 1 - on\r\n"

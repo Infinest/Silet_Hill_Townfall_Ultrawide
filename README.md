@@ -85,7 +85,7 @@ Enabled=1
 ;            2 - constrain the in-game HUD to a centered 21:9 box
 ; Applies only during gameplay. Main menu, inventory and pause
 ; screens always use the full screen width.
-Constrain=1
+Constrain=0
 
 [Log]
 ; 0 - off, 1 - on

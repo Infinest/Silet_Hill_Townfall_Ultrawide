@@ -45,7 +45,7 @@ bool gCfgLoaded = false;
 void LoadConfig() {
     if (gCfgLoaded) return;
     gCfgLoaded = true;
-    gConstrain = ConfigInt(L"Constrain", 1);
+    gConstrain = ConfigInt(L"Constrain", 0);
     if (gConstrain < 0 || gConstrain > 2) gConstrain = 1;
     gAspect = (gConstrain == 2) ? 21.0 / 9.0 : 16.0 / 9.0;
     LogLine("UI: Constrain=%d", gConstrain);
