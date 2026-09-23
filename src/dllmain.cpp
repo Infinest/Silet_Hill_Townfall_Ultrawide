@@ -96,7 +96,13 @@ static void EnsureDefaultIni() {
         ";            2 - constrain the in-game HUD to a centered 21:9 box\r\n"
         "; Applies only during gameplay. Main menu, inventory and pause\r\n"
         "; screens always use the full screen width.\r\n"
-        "Constrain=1\r\n";
+        "Constrain=1\r\n"
+        "\r\n"
+        "[Log]\r\n"
+        "; 0 - off, 1 - on\r\n"
+        "; Writes TownfallUltraWide.log next to the DLL. Only useful for\r\n"
+        "; troubleshooting; keep off during normal play.\r\n"
+        "Enabled=0\r\n";
 
     HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
                            nullptr);

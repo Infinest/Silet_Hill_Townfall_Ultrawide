@@ -171,6 +171,33 @@ int Format(char* out, size_t cap, const char* fmt, va_list ap) {
 }  // namespace
 
 void LogLine(const char* fmt, ...) {
+    // Logging is opt-in via [Log] Enabled=1 in TownfallUltraWide.ini
+    // (default 0: no log file is created at all).
+    static volatile LONG logState = 0;  // 0 = unknown, 1 = off, 2 = on
+    LONG s = logState;
+    if (s == 0) {
+        if (InterlockedCompareExchange(&logState, 1, 0) == 0) {
+            int v = 0;
+            wchar_t path[MAX_PATH];
+            HMODULE self = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)&LogLine, &self)) {
+                GetModuleFileNameW(self, path, MAX_PATH);
+                wchar_t* slash = wcsrchr(path, L'\\');
+                if (slash) {
+                    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"TownfallUltraWide.ini");
+                    v = GetPrivateProfileIntW(L"Log", L"Enabled", 0, path);
+                }
+            }
+            logState = v ? 2 : 1;
+        } else {
+            while (logState == 0) Sleep(0);
+        }
+        s = logState;
+    }
+    if (s != 2) return;
+
     EnsureInit();
     char buf[2048];
     va_list ap;

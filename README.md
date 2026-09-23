@@ -86,6 +86,12 @@ Enabled=1
 ; Applies only during gameplay. Main menu, inventory and pause
 ; screens always use the full screen width.
 Constrain=1
+
+[Log]
+; 0 - off, 1 - on
+; Writes TownfallUltraWide.log next to the DLL. Only useful for
+; troubleshooting; keep off during normal play.
+Enabled=0
 ```
 
 ## Known notes
