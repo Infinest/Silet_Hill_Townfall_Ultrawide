@@ -47,7 +47,7 @@ Combined result at 5120x1440: full-width rendering, horizontal FOV widens
 exactly by the aspect ratio, and vertical FOV stays at the authored value —
 identical vertical framing to the stock 21:9 mode, without bars or stretch.
 
-**HUD constraint (step 2).** The visible HUD is Slate/UMG parented under the
+**HUD constraint** The visible HUD is Slate/UMG parented under the
 viewport overlay (`SOverlay`). A vtable hook on `SOverlay::OnArrangeChildren`
 (slot 71) presents the overlay's children a modified `FGeometry` — a centered
 box instead of the full 32:9 rect — so every HUD widget lays itself out
@@ -63,7 +63,7 @@ install and the game runs unmodified (enable `[Log] Enabled=1` and check
 ## Install
 
 1. Copy `dist\dxgi.dll` into
-   `E:\SteamLibrary\steamapps\common\Townfall\Townfall\Binaries\Win64\`
+   `Townfall\Townfall\Binaries\Win64\`
 2. Start the game normally (through Steam).
 
 On first launch the mod creates `TownfallUltraWide.ini` with defaults next to
@@ -133,13 +133,3 @@ tools/               - reversing + test toolchain
   disasm/annotate/find_*   - capstone disassembly + xref scanners
   steam_boot_test.py       - Steam launch + window/brightness boot tester
 ```
-
-## Analysis summary (difficulty assessment)
-
-Easy overall (a few evenings) *because the game ships a full PDB* - the
-hardest part of game modding (finding the code) was reading symbols. No
-anti-cheat, no integrity checks, single-player. The investigation found the
-clamp is two coordinated mechanisms (rect + matrix); fixing only the first
-produced a stretched image, which the in-engine diagnostic hooks (camera FOV,
-camera aspect property, view rects, projection matrix entries) then nailed
-down exactly.
